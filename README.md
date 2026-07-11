@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-tiktok/brand/main/social/go-tiktok.png" alt="go-tiktok/tiktok" width="720"></p>
+
 # go-tiktok/tiktok
 
 [![CI](https://github.com/go-tiktok/tiktok/actions/workflows/ci.yml/badge.svg)](https://github.com/go-tiktok/tiktok/actions/workflows/ci.yml)
