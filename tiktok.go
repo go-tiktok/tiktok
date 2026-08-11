@@ -5,10 +5,15 @@
 //
 // TikTok does not publish or support a stable public web API. The endpoints
 // used here are the ones its own website calls, and TikTok actively defends
-// them: requests frequently require a valid msToken query parameter/cookie,
-// a signed "X-Bogus"/"_signature" parameter, and often a logged-in sessionid
-// cookie. TikTok also returns anti-bot responses (HTTP 403/429, or a 200 with
-// an empty "{}" body) when it decides a request looks automated.
+// them. This client computes the "X-Bogus" request signature in pure Go (see
+// [XBogus], verified against the public reference implementation) and folds it
+// into every signed request, but X-Bogus alone is no longer sufficient: TikTok
+// also requires a browser-minted msToken cookie and a newer "X-Gnarly"
+// signature, both derived from JavaScript fingerprinting that cannot be
+// reproduced without a browser. Supply an msToken and sessionid captured from a
+// real logged-in browser via [WithMSToken] and [WithSessionID]. TikTok returns
+// anti-bot responses (HTTP 403/429, or a 200 with an empty or "{}" body) when it
+// decides a request looks automated.
 //
 // Consequently this client is BEST-EFFORT: it builds correct requests and
 // parses correct responses, but it can and will break without notice when
@@ -53,6 +58,10 @@ type Client struct {
 	// SessionID is the sessionid cookie for authenticated reads, sent when
 	// non-empty.
 	SessionID string
+
+	// now returns the current time; overridable in tests so a signed query is
+	// deterministic. Defaults to time.Now.
+	now func() time.Time
 }
 
 // Option configures a [Client].
@@ -89,11 +98,28 @@ func New(opts ...Option) *Client {
 		BaseURL:    DefaultBaseURL,
 		HTTPClient: http.DefaultClient,
 		UserAgent:  DefaultUserAgent,
+		now:        time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c
+}
+
+// signedQuery adds the msToken (when configured), encodes q, and appends the
+// X-Bogus signature computed over that exact encoded string — the way TikTok's
+// web client signs its item_list/user/list requests. It returns the full raw
+// query string ready to place after "?".
+func (c *Client) signedQuery(q url.Values) string {
+	if c.MSToken != "" {
+		q.Set("msToken", c.MSToken)
+	}
+	enc := q.Encode()
+	nowFn := c.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	return enc + "&X-Bogus=" + XBogus(enc, c.UserAgent, nowFn().Unix())
 }
 
 // Video is a single public TikTok video.
@@ -157,32 +183,65 @@ var webParams = map[string]string{
 // An empty result (no videos, HasMore=false) is returned without error. A
 // non-2xx status, an empty/anti-bot body, or malformed JSON returns an error.
 func (c *Client) UserPosts(ctx context.Context, secUid string, count int, cursor string) (*UserFeed, error) {
-	endpoint := c.BaseURL + "/api/post/item_list/"
+	q := c.baseValues()
+	q.Set("secUid", secUid)
+	q.Set("count", strconv.Itoa(count))
+	q.Set("cursor", cursor)
+	return c.itemList(ctx, "/api/post/item_list/", q)
+}
 
+// FollowingFeed fetches one page of the authenticated viewer's following feed —
+// the videos from accounts they follow — via TikTok's web following item_list
+// endpoint:
+//
+//	GET {BaseURL}/api/following/item_list/?count=<n>&maxCursor=<c>&...&X-Bogus=…
+//
+// It requires a session (see [WithSessionID]) and a browser-minted msToken (see
+// [WithMSToken]); without a valid msToken TikTok answers the anti-bot empty body
+// even though the X-Bogus signature is correct — see the note on [XBogus].
+func (c *Client) FollowingFeed(ctx context.Context, count int, maxCursor string) (*UserFeed, error) {
+	q := c.baseValues()
+	q.Set("count", strconv.Itoa(count))
+	q.Set("maxCursor", maxCursor)
+	q.Set("minCursor", "0")
+	return c.itemList(ctx, "/api/following/item_list/", q)
+}
+
+// Recommend fetches one page of the "For You" / home recommend feed via
+// TikTok's web recommend item_list endpoint:
+//
+//	GET {BaseURL}/api/recommend/item_list/?count=<n>&...&X-Bogus=…
+//
+// Like [Client.FollowingFeed] it needs a browser-minted msToken to get past the
+// anti-bot layer; the request is otherwise correctly signed.
+func (c *Client) Recommend(ctx context.Context, count int, cursor string) (*UserFeed, error) {
+	q := c.baseValues()
+	q.Set("count", strconv.Itoa(count))
+	q.Set("cursor", cursor)
+	q.Set("pull_type", "0")
+	return c.itemList(ctx, "/api/recommend/item_list/", q)
+}
+
+// baseValues returns a fresh url.Values seeded with the constant web parameters.
+func (c *Client) baseValues() url.Values {
 	q := url.Values{}
 	for k, v := range webParams {
 		q.Set(k, v)
 	}
-	q.Set("secUid", secUid)
-	q.Set("count", strconv.Itoa(count))
-	q.Set("cursor", cursor)
-	if c.MSToken != "" {
-		q.Set("msToken", c.MSToken)
-	}
+	return q
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
+// itemList performs a signed GET against an item_list-shaped endpoint and maps
+// the response to a [UserFeed]. It sets the standard headers/cookies, appends
+// the X-Bogus signature, and classifies TikTok's anti-bot responses (non-2xx,
+// empty body, or a non-zero in-band statusCode) as errors.
+func (c *Client) itemList(ctx context.Context, path string, q url.Values) (*UserFeed, error) {
+	endpoint := c.BaseURL + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+c.signedQuery(q), nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
-	req.Header.Set("Referer", DefaultBaseURL+"/")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	if c.SessionID != "" {
-		req.AddCookie(&http.Cookie{Name: "sessionid", Value: c.SessionID})
-	}
-	if c.MSToken != "" {
-		req.AddCookie(&http.Cookie{Name: "msToken", Value: c.MSToken})
-	}
+	c.decorate(req)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -204,12 +263,20 @@ func (c *Client) UserPosts(ctx context.Context, secUid string, count int, cursor
 	// a bare "{}" (HTTP 200). Treat an empty body as an explicit error; "{}"
 	// decodes to a zero response and is handled below.
 	if len(body) == 0 {
-		return nil, fmt.Errorf("tiktok: empty response body (likely anti-bot block; try msToken/sessionid)")
+		return nil, fmt.Errorf("tiktok: empty response body (likely anti-bot block; " +
+			"a browser-minted msToken is required)")
 	}
 
 	var raw itemListResponse
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("tiktok: decode item_list response: %w", err)
+	}
+	// A non-zero statusCode is TikTok's in-band refusal (typically the signing /
+	// msToken wall), returned with HTTP 200; surface it rather than a healthy
+	// empty feed.
+	if raw.StatusCode != 0 {
+		return nil, fmt.Errorf("tiktok: item_list refused (statusCode %d %s); "+
+			"a browser-minted msToken is required", raw.StatusCode, raw.StatusMsg)
 	}
 
 	feed := &UserFeed{
@@ -238,6 +305,19 @@ func (c *Client) UserPosts(ctx context.Context, secUid string, count int, cursor
 	return feed, nil
 }
 
+// decorate sets the standard headers and cookies TikTok's web client sends.
+func (c *Client) decorate(req *http.Request) {
+	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Referer", DefaultBaseURL+"/")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	if c.SessionID != "" {
+		req.AddCookie(&http.Cookie{Name: "sessionid", Value: c.SessionID})
+	}
+	if c.MSToken != "" {
+		req.AddCookie(&http.Cookie{Name: "msToken", Value: c.MSToken})
+	}
+}
+
 // snippet returns a short, printable prefix of a response body for use in
 // error messages.
 func snippet(b []byte) string {
@@ -250,9 +330,11 @@ func snippet(b []byte) string {
 
 // itemListResponse mirrors the relevant fields of TikTok's item_list JSON.
 type itemListResponse struct {
-	ItemList []item     `json:"itemList"`
-	Cursor   string     `json:"cursor"`
-	HasMore  boolNumber `json:"hasMore"`
+	ItemList   []item     `json:"itemList"`
+	Cursor     string     `json:"cursor"`
+	HasMore    boolNumber `json:"hasMore"`
+	StatusCode int        `json:"statusCode"`
+	StatusMsg  string     `json:"statusMsg"`
 }
 
 type item struct {

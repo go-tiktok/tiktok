@@ -58,11 +58,8 @@ func (c *Client) Following(ctx context.Context, secUid string, count int, maxCur
 	q.Set("count", strconv.Itoa(count))
 	q.Set("maxCursor", maxCursor)
 	q.Set("minCursor", "0")
-	if c.MSToken != "" {
-		q.Set("msToken", c.MSToken)
-	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+c.signedQuery(q), nil)
 	if err != nil {
 		return nil, err
 	}
